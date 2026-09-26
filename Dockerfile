@@ -1,67 +1,73 @@
 FROM nvidia/cuda:13.0.1-devel-ubuntu24.04
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    VIRTUAL_ENV=/opt/venv \
-    PATH="/opt/venv/bin:$PATH"
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
 
-# ------------------------------------------------------------
-# System packages
-# ------------------------------------------------------------
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 \
-        python3-pip \
-        python3-venv \
-        git \
-        curl \
-        ca-certificates \
-        libgl1 \
-        libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/* \
-    && python3 -m venv /opt/venv
+# Hugging Face / model cache
+ENV HF_HOME=/runpod-volume/hf_cache
+ENV HUGGINGFACE_HUB_CACHE=/runpod-volume/hf_cache/hub
+
+# CUDA
+ENV CUDA_HOME=/usr/local/cuda
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
 
 WORKDIR /app
 
-# ------------------------------------------------------------
-# Python tooling
-# ------------------------------------------------------------
+# --------------------------------------------------
+# System packages
+# --------------------------------------------------
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    python3-venv \
+    git \
+    curl \
+    ca-certificates \
+    libgl1 \
+    libglib2.0-0 \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# --------------------------------------------------
+# Python virtual environment
+# --------------------------------------------------
+
+RUN python3 -m venv ${VIRTUAL_ENV}
 
 RUN python -m pip install --upgrade \
-        pip \
-        setuptools \
-        wheel
+    pip \
+    setuptools \
+    wheel
 
-# ------------------------------------------------------------
-# PaddlePaddle
-# ------------------------------------------------------------
-
-RUN python -m pip install \
-        paddlepaddle-gpu==3.3.1 \
-        -i https://www.paddlepaddle.org.cn/packages/stable/cu130/
-
-# ------------------------------------------------------------
-# PaddleOCR + vLLM + FastAPI
-# ------------------------------------------------------------
+# --------------------------------------------------
+# PaddlePaddle GPU
+# --------------------------------------------------
 
 RUN python -m pip install \
-        "paddleocr[doc-parser]" \
-        vllm==0.26.0 \
-        safetensors \
-        "huggingface_hub[hf_transfer]" \
-        fastapi \
-        "uvicorn[standard]" \
-        python-multipart
+    paddlepaddle-gpu==3.3.1 \
+    -i https://www.paddlepaddle.org.cn/packages/stable/cu130/
 
-# ------------------------------------------------------------
+# --------------------------------------------------
+# Python dependencies
+# --------------------------------------------------
+
+COPY requirements.txt .
+
+RUN python -m pip install -r requirements.txt
+
+# --------------------------------------------------
 # Application
-# ------------------------------------------------------------
+# --------------------------------------------------
 
-COPY app.py /app/app.py
-COPY entrypoint.sh /app/entrypoint.sh
+COPY app.py .
+COPY entrypoint.sh .
 
-RUN chmod +x /app/entrypoint.sh
+RUN chmod +x entrypoint.sh
 
 # vLLM
 EXPOSE 8000

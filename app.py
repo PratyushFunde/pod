@@ -1,34 +1,34 @@
 import os
 import time
+import uuid
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-
 from paddleocr import PaddleOCRVL
 
 
-# ------------------------------------------------------------
-# Configuration
-# ------------------------------------------------------------
-
-NETWORK_VOLUME = os.getenv(
-    "NETWORK_VOLUME",
-    "/runpod-volume",
+VLLM_URL = os.getenv(
+    "VLLM_URL",
+    "http://127.0.0.1:8000/v1",
 )
 
-os.environ["HF_HOME"] = f"{NETWORK_VOLUME}/hf_cache"
-os.environ["HUGGINGFACE_HUB_CACHE"] = (
-    f"{NETWORK_VOLUME}/hf_cache/hub"
-)
-
-MODEL_NAME = os.getenv(
-    "VL_MODEL_PATH",
-    "PaddlePaddle/PaddleOCR-VL-1.5",
+VLLM_MODEL = os.getenv(
+    "VLLM_MODEL",
+    "PaddleOCR-VL-1.5-0.9B",
 )
 
 
-# ------------------------------------------------------------
-# FastAPI
-# ------------------------------------------------------------
+print("Initializing PaddleOCRVL...")
+
+pipeline = PaddleOCRVL(
+    pipeline_version="v1.5",
+    vl_rec_backend="vllm-server",
+    vl_rec_server_url=VLLM_URL,
+    vl_rec_api_model_name=VLLM_MODEL,
+    vl_rec_api_key="dummy",
+)
+
+print("PaddleOCRVL initialized successfully")
+
 
 app = FastAPI(
     title="ExtractHQ PaddleOCR-VL",
@@ -36,28 +36,12 @@ app = FastAPI(
 )
 
 
-# ------------------------------------------------------------
-# Initialize pipeline ONCE
-# ------------------------------------------------------------
-
-print("[app] Loading PaddleOCR-VL pipeline...")
-
-pipeline = PaddleOCRVL(
-    pipeline_version="v1.5",
-)
-
-print("[app] PaddleOCR-VL pipeline loaded.")
-
-
-# ------------------------------------------------------------
-# Health
-# ------------------------------------------------------------
-
 @app.get("/")
 def root():
     return {
         "status": "ok",
         "service": "ExtractHQ PaddleOCR-VL",
+        "model": VLLM_MODEL,
     }
 
 
@@ -65,12 +49,9 @@ def root():
 def health():
     return {
         "status": "ok",
+        "model": VLLM_MODEL,
     }
 
-
-# ------------------------------------------------------------
-# OCR
-# ------------------------------------------------------------
 
 @app.post("/ocr")
 async def ocr(file: UploadFile = File(...)):
@@ -83,37 +64,46 @@ async def ocr(file: UploadFile = File(...)):
 
     start = time.perf_counter()
 
-    # Save uploaded file temporarily
     input_dir = "/tmp/extracthq"
-
     os.makedirs(input_dir, exist_ok=True)
+
+    filename = (
+        f"{uuid.uuid4().hex}_"
+        f"{os.path.basename(file.filename)}"
+    )
 
     input_path = os.path.join(
         input_dir,
-        file.filename,
+        filename,
     )
-
-    with open(input_path, "wb") as f:
-        f.write(await file.read())
 
     try:
 
-        print(
-            f"[app] Processing: {file.filename}"
-        )
+        contents = await file.read()
 
-        output = pipeline.predict(
-            input_path
-        )
+        if not contents:
+            raise HTTPException(
+                status_code=400,
+                detail="Empty file",
+            )
+
+        with open(input_path, "wb") as f:
+            f.write(contents)
+
+        output = pipeline.predict(input_path)
 
         results = []
 
-        for res in output:
+        for result in output:
 
-            # PaddleOCR result object
-            results.append(
-                res
-            )
+            if hasattr(result, "json"):
+                results.append(result.json)
+
+            elif hasattr(result, "to_json"):
+                results.append(result.to_json())
+
+            else:
+                results.append(str(result))
 
         elapsed = time.perf_counter() - start
 
@@ -127,11 +117,10 @@ async def ocr(file: UploadFile = File(...)):
             "results": results,
         }
 
-    except Exception as exc:
+    except HTTPException:
+        raise
 
-        print(
-            f"[app] OCR failed: {exc}"
-        )
+    except Exception as exc:
 
         raise HTTPException(
             status_code=500,

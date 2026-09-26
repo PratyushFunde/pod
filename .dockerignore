@@ -1,0 +1,10 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+.venv
+venv
+environment_snapshot
+output
+.env
+.DS_Store
