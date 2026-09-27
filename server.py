@@ -1,231 +1,30 @@
-import asyncio
-import json
-import subprocess
-import sys
-import time
-import uuid
+import os
+import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
-import uvicorn
+import httpx
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, HttpUrl
+
+from paddleocr import PaddleOCRVL
 
 
 # ============================================================
 # Configuration
 # ============================================================
 
-APP_HOST = "0.0.0.0"
-APP_PORT = 8080
-
-VLLM_HOST = "127.0.0.1"
-VLLM_PORT = 8000
-
-MODEL_NAME = "PaddlePaddle/PaddleOCR-VL-1.5"
-SERVED_MODEL_NAME = "PaddleOCR-VL-1.5-0.9B"
-
-MAX_FILE_SIZE = 25 * 1024 * 1024
-
-ALLOWED_EXTENSIONS = {
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".webp",
-    ".bmp",
-    ".tif",
-    ".tiff",
-}
-
-UPLOAD_DIR = Path("/tmp/extracthq")
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-vllm_process = None
-pipeline = None
-
-
-# ============================================================
-# Start vLLM
-# ============================================================
-
-def start_vllm():
-
-    global vllm_process
-
-    print("Starting vLLM...", flush=True)
-
-    command = [
-        sys.executable,
-        "-m",
-        "vllm.entrypoints.openai.api_server",
-
-        "--model",
-        MODEL_NAME,
-
-        "--served-model-name",
-        SERVED_MODEL_NAME,
-
-        "--trust-remote-code",
-
-        "--host",
-        VLLM_HOST,
-
-        "--port",
-        str(VLLM_PORT),
-
-        "--max-num-batched-tokens",
-        "16384",
-    ]
-
-    print(" ".join(command), flush=True)
-
-    vllm_process = subprocess.Popen(
-        command,
-        stdout=None,
-        stderr=None,
-    )
-
-
-# ============================================================
-# Wait for vLLM
-# ============================================================
-
-def wait_for_vllm(timeout=900):
-
-    print("Waiting for vLLM...", flush=True)
-
-    deadline = time.monotonic() + timeout
-
-    while time.monotonic() < deadline:
-
-        if vllm_process.poll() is not None:
-
-            raise RuntimeError(
-                f"vLLM exited with code "
-                f"{vllm_process.returncode}"
-            )
-
-        try:
-
-            import socket
-
-            with socket.create_connection(
-                (VLLM_HOST, VLLM_PORT),
-                timeout=2,
-            ):
-                print(
-                    "vLLM is listening on "
-                    f"http://{VLLM_HOST}:{VLLM_PORT}",
-                    flush=True,
-                )
-
-                # Give model/API a little time
-                time.sleep(5)
-
-                return
-
-        except OSError:
-
-            time.sleep(2)
-
-    raise TimeoutError(
-        "vLLM did not start within "
-        f"{timeout} seconds."
-    )
-
-
-# ============================================================
-# Initialize PaddleOCR-VL
-# ============================================================
-
-def initialize_pipeline():
-
-    global pipeline
-
-    print("Initializing PaddleOCR-VL...", flush=True)
-
-    from paddleocr import PaddleOCRVL
-
-    pipeline = PaddleOCRVL(
-        pipeline_version="v1.5",
-
-        vl_rec_backend="vllm-server",
-
-        vl_rec_server_url=(
-            f"http://{VLLM_HOST}:{VLLM_PORT}/v1"
-        ),
-
-        vl_rec_api_model_name=SERVED_MODEL_NAME,
-
-        vl_rec_api_key="dummy",
-    )
-
-    print(
-        "PaddleOCR-VL initialized.",
-        flush=True,
-    )
-
-
-# ============================================================
-# Startup / Shutdown
-# ============================================================
-
-from contextlib import asynccontextmanager
-
-
-@asynccontextmanager
-async def lifespan(app):
-
-    global vllm_process
-
-    try:
-
-        start_vllm()
-
-        await asyncio.to_thread(
-            wait_for_vllm
-        )
-
-        await asyncio.to_thread(
-            initialize_pipeline
-        )
-
-        print()
-        print("========================================")
-        print(" ExtractHQ OCR SERVER READY")
-        print("========================================")
-        print(f"API:  http://0.0.0.0:{APP_PORT}")
-        print(f"vLLM: http://127.0.0.1:{VLLM_PORT}")
-        print()
-        print("GET  /health")
-        print("POST /ocr")
-        print("========================================")
-        print()
-
-        yield
-
-    finally:
-
-        if (
-            vllm_process is not None
-            and vllm_process.poll() is None
-        ):
-
-            print(
-                "Stopping vLLM...",
-                flush=True,
-            )
-
-            vllm_process.terminate()
-
-            try:
-
-                vllm_process.wait(
-                    timeout=15
-                )
-
-            except subprocess.TimeoutExpired:
-
-                vllm_process.kill()
+VLLM_URL = os.getenv(
+    "VLLM_URL",
+    "http://localhost:8080/v1",
+)
+
+MODEL_NAME = os.getenv(
+    "VLLM_MODEL_NAME",
+    "PaddleOCR-VL-1.6-0.9B",
+)
+
+MAX_DOWNLOAD_SIZE = 25 * 1024 * 1024  # 25 MB
 
 
 # ============================================================
@@ -235,248 +34,184 @@ async def lifespan(app):
 app = FastAPI(
     title="ExtractHQ PaddleOCR-VL API",
     version="1.0.0",
-    lifespan=lifespan,
 )
+
+
+# ============================================================
+# PaddleOCR-VL
+# ============================================================
+
+pipeline = PaddleOCRVL(
+    pipeline_version="v1.6",
+    vl_rec_backend="vllm-server",
+    vl_rec_server_url=VLLM_URL,
+    vl_rec_api_model_name=MODEL_NAME,
+)
+
+
+# ============================================================
+# Request model
+# ============================================================
+
+class PredictRequest(BaseModel):
+    image_url: HttpUrl
 
 
 # ============================================================
 # Health
 # ============================================================
 
-@app.get("/")
-def root():
-
+@app.get("/health")
+async def health():
     return {
         "status": "ok",
-        "service": "ExtractHQ PaddleOCR-VL",
+        "vllm_url": VLLM_URL,
         "model": MODEL_NAME,
-        "vllm_model": SERVED_MODEL_NAME,
-    }
-
-
-@app.get("/health")
-def health():
-
-    return {
-        "status": (
-            "ok"
-            if pipeline is not None
-            else "starting"
-        ),
-        "model": MODEL_NAME,
-        "vllm_model": SERVED_MODEL_NAME,
     }
 
 
 # ============================================================
-# OCR
+# Download image
 # ============================================================
 
-@app.post("/ocr")
-async def ocr(
-    file: UploadFile = File(...)
-):
-
-    if pipeline is None:
-
-        raise HTTPException(
-            status_code=503,
-            detail="OCR pipeline is not ready.",
-        )
-
-    if not file.filename:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Filename is required.",
-        )
-
-    extension = Path(
-        file.filename
-    ).suffix.lower()
-
-    if extension not in ALLOWED_EXTENSIONS:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Unsupported file type: {extension}"
-            ),
-        )
-
-    contents = await file.read()
-
-    if not contents:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded file is empty.",
-        )
-
-    if len(contents) > MAX_FILE_SIZE:
-
-        raise HTTPException(
-            status_code=413,
-            detail="File exceeds 25 MB.",
-        )
-
-    temp_path = (
-        UPLOAD_DIR
-        / f"{uuid.uuid4().hex}{extension}"
+async def download_image(url: str, output_path: str):
+    timeout = httpx.Timeout(
+        connect=10.0,
+        read=60.0,
+        write=10.0,
+        pool=10.0,
     )
+
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        follow_redirects=True,
+    ) as client:
+
+        async with client.stream("GET", url) as response:
+
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Failed to download image. HTTP {response.status_code}",
+                )
+
+            content_type = response.headers.get(
+                "content-type",
+                "",
+            ).lower()
+
+            if not content_type.startswith("image/"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"URL did not return an image. Content-Type: {content_type}",
+                )
+
+            content_length = response.headers.get("content-length")
+
+            if content_length:
+                if int(content_length) > MAX_DOWNLOAD_SIZE:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Image exceeds 25 MB limit",
+                    )
+
+            downloaded = 0
+
+            with open(output_path, "wb") as file:
+
+                async for chunk in response.aiter_bytes(
+                    chunk_size=1024 * 1024
+                ):
+                    downloaded += len(chunk)
+
+                    if downloaded > MAX_DOWNLOAD_SIZE:
+                        raise HTTPException(
+                            status_code=413,
+                            detail="Image exceeds 25 MB limit",
+                        )
+
+                    file.write(chunk)
+
+
+# ============================================================
+# Prediction
+# ============================================================
+
+@app.post("/predict")
+async def predict(request: PredictRequest):
+
+    parsed_url = urlparse(str(request.image_url))
+
+    suffix = Path(parsed_url.path).suffix
+
+    if not suffix:
+        suffix = ".png"
+
+    temp_path = None
 
     try:
 
-        temp_path.write_bytes(contents)
+        # ----------------------------------------------------
+        # Create temporary image
+        # ----------------------------------------------------
 
-        print(
-            f"Processing: {file.filename}",
-            flush=True,
+        with tempfile.NamedTemporaryFile(
+            suffix=suffix,
+            delete=False,
+        ) as temp_file:
+
+            temp_path = temp_file.name
+
+        # ----------------------------------------------------
+        # Download image
+        # ----------------------------------------------------
+
+        await download_image(
+            str(request.image_url),
+            temp_path,
         )
 
-        start = time.perf_counter()
+        # ----------------------------------------------------
+        # PaddleOCR-VL
+        # ----------------------------------------------------
 
-        results = await asyncio.to_thread(
-            pipeline.predict,
-            str(temp_path),
-        )
-
-        processing_time = round(
-            time.perf_counter() - start,
-            3,
-        )
+        results = pipeline.predict(temp_path)
 
         json_results = []
         markdown_results = []
 
         for result in results:
 
-            # -----------------------------
-            # JSON
-            # -----------------------------
+            # PaddleOCR result JSON
+            json_data = result.json
 
-            result_json = getattr(
-                result,
-                "json",
-                None,
-            )
+            json_results.append(json_data)
 
-            if callable(result_json):
+            # PaddleOCR Markdown
+            markdown = result.markdown
 
-                result_json = result_json()
+            markdown_results.append(markdown)
 
-            if result_json is None:
-
-                if hasattr(
-                    result,
-                    "to_json",
-                ):
-
-                    result_json = result.to_json()
-
-                else:
-
-                    result_json = str(result)
-
-            if isinstance(
-                result_json,
-                str,
-            ):
-
-                try:
-
-                    result_json = json.loads(
-                        result_json
-                    )
-
-                except json.JSONDecodeError:
-
-                    pass
-
-            json_results.append(
-                result_json
-            )
-
-            # -----------------------------
-            # Markdown
-            # -----------------------------
-
-            markdown = ""
-
-            if hasattr(
-                result,
-                "markdown",
-            ):
-
-                value = result.markdown
-
-                if callable(value):
-
-                    value = value()
-
-                if isinstance(
-                    value,
-                    str,
-                ):
-
-                    markdown = value
-
-            markdown_results.append(
-                markdown
-            )
-
-        print(
-            f"Completed in {processing_time}s",
-            flush=True,
-        )
-
-        return JSONResponse(
-            content={
-                "success": True,
-                "filename": file.filename,
-                "processing_time_seconds": (
-                    processing_time
-                ),
+        return {
+            "success": True,
+            "model": MODEL_NAME,
+            "results": {
                 "json": json_results,
-                "markdown": markdown_results,
-            }
-        )
+                "markdown": "\n\n".join(markdown_results),
+            },
+        }
 
-    except Exception as exc:
+    except HTTPException:
+        raise
 
-        print(
-            f"OCR ERROR: {exc}",
-            file=sys.stderr,
-            flush=True,
-        )
+    except Exception as e:
 
         raise HTTPException(
             status_code=500,
-            detail=f"OCR failed: {exc}",
+            detail=str(e),
         )
 
     finally:
 
-        try:
-
-            temp_path.unlink(
-                missing_ok=True
-            )
-
-        except OSError:
-
-            pass
-
-
-# ============================================================
-# Main
-# ============================================================
-
-if __name__ == "__main__":
-
-    uvicorn.run(
-        app,
-        host=APP_HOST,
-        port=APP_PORT,
-        reload=False,
-    )
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
